@@ -2,8 +2,8 @@ open Core.Std
 open Common
 
 module type TIME = sig
-  type t
-  type span
+  type t (* the absolute time such as the Unix time or the time since the simulation was started *)
+  type span (* the interval of time *)
   val init : unit -> t
   val compare : t -> t -> int (*TODO ask anil why explicity write this instead
   of using Core's with compare *)
@@ -14,7 +14,7 @@ module type TIME = sig
   val span_to_string: span -> string
   val to_string: t -> string
   val to_int: t -> int
-  val wait_until: t -> unit
+  val wait_until: t -> unit (* a blocking wait for RES or instantaneously returns unit for a DES *)
   val store: t -> (unit -> t)
 end 
 

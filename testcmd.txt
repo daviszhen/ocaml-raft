@@ -1,0 +1,3 @@
+_build/lib/cmdstart.byte discrete -nodes 3  -follower Uniform-150-155 -candidate Uniform-11-22 -leader Fixed-75 -delay Fixed-7 -termOnTimeout 50000 -termOnElec -cmds 0 -backoff -json > output.json
+_build/lib/cmdstart.byte discrete -nodes 5  -follower Uniform-150-155 -candidate Uniform-11-22 -leader Fixed-75 -delay Fixed-7 -termOnTimeout 50000 -termOnElec -cmds 0 -backoff -json > output.json
+_build/lib/cmdstart.byte realtime -nodes 3 -d -follower Uniform-150-155 -candidate Uniform-11-22 -leader Fixed-75 -delay Fixed-7 -termOnTimeout 50000 -termOnElec -cmds 0 -backoff -json > output.json

@@ -12,3 +12,6 @@ _build/
 _oasis
 myocamlbuild.ml
 setup.ml
+.vscode
+_build
+*.json

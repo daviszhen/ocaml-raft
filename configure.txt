@@ -1,0 +1,5 @@
+设置ocaml版本
+opam switch create ocaml-raft 4.01.0
+安装需要的包
+opam install core
+opam install async
