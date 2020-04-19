@@ -35,6 +35,7 @@ let debug x = if (P.debug_mode) then (printf " %s  \n" x) else ()
 let json x = if (P.json_mode) then (printf " %s \n" x) else ()
 
 (* TODO: consider spliting this up into 3 functions*)
+(* get the timeout on the state *)
 let timeout (s:State.t) = 
   match s.mode with
   | Follower | Leader -> MonoTime.span_of_float (P.timeout () s.mode)
@@ -54,30 +55,35 @@ type datacollection = {
   mutable total_election_time: MonoTime.t
     }
 
+(* The data's type is the datacollection above. *)
 let data = {
   pkts=0; 
   client_pkts=0; 
   firstele=None; 
-  full_latency= (None,[]);
+  full_latency= (None,[]); (* <option,list>. There are durations of Client Latency Timer in the list *)
   commit_requests =0;
-  election_time = [];
+  election_time = []; (* <id,start_time> list *)
   total_election_time = MonoTime.init();
   }
 
+(* record counts of packet *)
 let incr_pkts() =
   match (P.term_conditions LeaderEst), data.firstele with
   | false,_ | true,None -> data.pkts <- data.pkts +1
   | _ -> ()
 
+(* election_timer id starts at the start_time when the candidate starts an election *)
 let election_timer_start id start_time =
     data.election_time <- (List.Assoc.add data.election_time id start_time)
 
+(* election_timer id stops at the stop_time when the candidate wins the election or go to follower again *)
 let election_timer_stop id stop_time =
    let start_time = List.Assoc.find_exn data.election_time id  in
    let duration = MonoTime.diff stop_time start_time in
    data.election_time <- (List.Assoc.remove data.election_time id );
    data.total_election_time <- (MonoTime.add data.total_election_time duration)
 
+(* remove all election timers *)
 let rec final_election_time final_time = 
   match data.election_time with
   | [] -> ()
@@ -87,7 +93,7 @@ let rec final_election_time final_time =
         data.total_election_time <- (MonoTime.add data.total_election_time duration);
         final_election_time final_time
 
-
+(* Client Latency Timer starts when the client sends the request, stops when the client get the committed request *)
 let client_latency opt = 
   match opt with
   | `Start start_time -> (
@@ -143,9 +149,11 @@ module RaftImpl : RAFT = struct
 
 module Comms : COMMS = struct 
 
+(* Generate a RaftEvent which contains [e] will be delivered to the [dist] at the [t + delay] *)
 let unicast_replica (dist: IntID.t) (t:MonoTime.t) (e) = 
   (*TODO: modify these to allow the user to specify some deley
    * distribution/bound *)
+   (* if the probability <= P.loss ,the we drop the packet *)
  if (NumberGen.to_drop P.loss) then 
   (debug "packet dropped"; Ignore t)
  else (
@@ -157,6 +165,7 @@ let unicast_replica (dist: IntID.t) (t:MonoTime.t) (e) =
   incr_pkts();
   RaftEvent (arriv ,dist ,e ) )
 
+(* Generate a ClientEvent which contains [e] will be delivered to the client at the [t + delay] *)
 let unicast_client (t:MonoTime.t) (e) =
   if (NumberGen.to_drop P.loss) then 
   (debug "packet dropped"; Ignore t)
@@ -168,17 +177,18 @@ let unicast_client (t:MonoTime.t) (e) =
   data.client_pkts <- data.client_pkts + 1;
   ClientEvent (arriv, e))
 
+(* Deliver [e] to [dests] *)
 let broadcast (dests:IntID.t list) (t:MonoTime.t) e  = 
   List.map dests ~f:(fun dst -> unicast_replica(dst) t e) 
 
 end 
 
-
+(* the definition of the quorum or majority *)
 let checkElection (s:State.t) = 
   (* TODO: check exactly def of majority, maybe off by one error here *)
   (List.length s.votesGranted) > ((List.length s.allNodes)+1)/2
 
-
+(* the follower start the election or the candidate restart the election *)
 let rec  startCand (s:State.t) = 
   debug "Entering Candidate Mode / Restarting Electon";
   let s_new =  State.tick StartCandidate s in
@@ -202,11 +212,15 @@ let rec  startCand (s:State.t) =
        ",'RPC':'requestVote','info':'Request Vote Broadcast<br>term:"^(Index.to_string s_new.term)^"<br>Last Index:"^
          (Index.to_string s_new.lastlogIndex)^"<br>Last Term:"^(Index.to_string
          s_new.lastlogTerm)^ "',");
+  (* Send RequestVote request *)
   let reqs = Comms.broadcast s_new.allNodes (s_new.time()) 
+    (* Set callback requestVoteRq*)
     (requestVoteRq args) in
+    (* Attach request to a timeout event *)
   let s_new,timeout_event = refreshTimer s_new in
   (s_new, timeout_event@reqs)
 
+(* Generate a timeout event [RaftEvent] for the state [s] *)
 and refreshTimer (s:State.t) = 
   let s_new = State.tick Set s in
   let timeout = MonoTime.add (s.time()) (timeout s) in
@@ -217,6 +231,7 @@ and refreshTimer (s:State.t) =
   let (event:EventList.item) = RaftEvent (timeout, s.id, checkTimer s_new.timer) in 
   (s_new,[event])
 
+(* Node will do the action after the timeout  *)
 and checkTimer (timer_num:int) (s:State.t) = 
   debug "Checking timer"; 
   if (s.timer=timer_num) then (
@@ -235,6 +250,7 @@ and checkTimer (timer_num:int) (s:State.t) =
     debug "timer no longer valid"; 
     (s,[]) )
 
+(* The client will give another request after the timeout *)
 and checkTimer_client (timer_num:int) (c:Client.t) = 
   debug "Checking timer"; 
   if (c.timer=timer_num) then (
@@ -246,6 +262,7 @@ and checkTimer_client (timer_num:int) (c:Client.t) =
 
 (* this function send heartbeat versions of AppendEntries to all other nodes *)
 and dispatchAppendEntries (s:State.t) =
+  (* [dispatch id] will deliver AppendEntries to node [id] *)
   let dispatch id = 
     let next_index = List.Assoc.find_exn s.nextIndex id in
     let (prev_index,prev_term) = Log.specific_index_term (Index.pred (List.Assoc.find_exn s.nextIndex id)) s.log in
@@ -269,7 +286,7 @@ and dispatchAppendEntries (s:State.t) =
   let reqs = List.map s.allNodes ~f:dispatch in
   let s_new,timeout_event = refreshTimer s in
   (s_new, timeout_event@reqs )
-
+(* It will send AppendEntries to the node [id] *)
 and dispatchAppendEntries_unicast id (s:State.t) =
     let next_index = List.Assoc.find_exn s.nextIndex id in
     let (prev_index,prev_term) = Log.specific_index_term (Index.pred (List.Assoc.find_exn s.nextIndex id)) s.log in
@@ -285,7 +302,7 @@ and dispatchAppendEntries_unicast id (s:State.t) =
         } ) in  
   Comms.unicast_replica id (s.time()) (appendEntriesRq args) 
 
-
+(* The node stepdown to the follower *)
 and startFollow term (s:State.t)  = debug "Entering Follower mode";
   (* used for setdown too so need to reset follower state *)
   let s = State.tick (StepDown term) s in 
@@ -297,10 +314,13 @@ and startFollow term (s:State.t)  = debug "Entering Follower mode";
 
   refreshTimer s
 
+(* The candidate wins the quorum and becomes the leader*)
 and startLeader (s:State.t) = 
   debug "Election Won - Becoming Leader";
   if (data.firstele=None) then data.firstele <- Some (s.time()) else ();
+  (* The node converts to the leader and the leader sends AE requests *)
   let s_new,dispatch_pkts = dispatchAppendEntries (State.tick StartLeader s) in
+  (* Close the election timer *)
   election_timer_stop s.id (s.time());
   json("{'node':"^(IntID.to_string
     s_new.id)^",'newMode':'leader','time':"^(MonoTime.to_string
@@ -309,6 +329,8 @@ and startLeader (s:State.t) =
     s_new.lastlogIndex)^"last Term:"^(Index.to_string s_new.lastlogTerm)^"'}");
   (s_new, dispatch_pkts)
 
+(* The comparison between [incoming_mode,term] with [s.mode,s.term]*)
+(* Some actions will be taken after the comparison *)
 and stepDown incoming_mode term lead_id_maybe (s:State.t) = 
   let s_new,e_new = (
       if (term > s.term) then 
@@ -351,6 +373,7 @@ and stepDown incoming_mode term lead_id_maybe (s:State.t) =
 
   (* TODO ask anil why s needs to explicitly annotated to access its field *)
 
+(* When the node receive a RV request,it will call the function and send the response *)
 and requestVoteRq (args: Rpcs.RequestVoteArg.t) (s:State.t) =
   debug ("I've got a vote request from: "^ IntID.to_string args.cand_id^ 
          " term number: "^Index.to_string args.term);
@@ -361,6 +384,7 @@ and requestVoteRq (args: Rpcs.RequestVoteArg.t) (s:State.t) =
     s_new.term)^"<br>lastIndex:"^(Index.to_string
     s_new.lastlogIndex)^"<br>lastTerm:"^(Index.to_string
     s_new.lastlogTerm)^"',");
+  (* Grant the vote or not *)
   let vote = 
     (args.term = s_new.term) &&  (
     (args.last_term > s_new.lastlogTerm ) || 
@@ -391,6 +415,7 @@ and requestVoteRq (args: Rpcs.RequestVoteArg.t) (s:State.t) =
   (s_new, (Comms.unicast_replica(args.cand_id) (s_new.time()) (requestVoteRs res
   s_new.id))::e_new)
   
+(* When the node receive a RV response,it will call the function *)
 and requestVoteRs (res: Rpcs.RequestVoteRes.t) id (s:State.t) = 
   debug ("Receive vote request reply from "^ IntID.to_string id );
   debug (Rpcs.RequestVoteRes.to_string res);
@@ -403,12 +428,14 @@ and requestVoteRs (res: Rpcs.RequestVoteRes.t) id (s:State.t) =
       let s = State.tick (VoteFrom (id,res.votegranted)) s in
       if (res.votegranted) then (
         debug "Vote was granted";
+        (* Get the quorum and Go to the leader *)
         (if (checkElection s) then startLeader s else (s, [])) 
       ) else(
         debug "Vote wasn't granted"; (s,[]) 
       )
       ) else (s, []) )
 
+(* When the node receive a AE request,it will call the function and send the response *)
 and appendEntriesRq (args: Rpcs.AppendEntriesArg.t) (s:State.t) =
   (* in terms of log consistenty there our 4 states: 
      - perfect consisenty - just append entries
@@ -489,6 +516,7 @@ and appendEntriesRq (args: Rpcs.AppendEntriesArg.t) (s:State.t) =
     (s,[Comms.unicast_replica(args.lead_id) (s.time()) (appendEntriesRs res s.id)])
     end
 
+(* When the node receive a AE response,it will call the function*)
 and appendEntriesRs (res: Rpcs.AppendEntriesRes.t) id (s:State.t) =
   debug (Rpcs.AppendEntriesRes.to_string res);
   (* 3 term cases: *)
@@ -548,7 +576,7 @@ and appendEntriesRs (res: Rpcs.AppendEntriesRes.t) id (s:State.t) =
         else (s_new, [dispatchAppendEntries_unicast id s_new]) )
     | Candidate | Follower -> (s,[]) ) )
 
-
+(* When the node receive a client request,it will call the function and send the response *)
  and clientRq (args: Rpcs.ClientArg.t) (s:State.t) = 
   debug (Rpcs.ClientArg.to_string args);
   let cmd = Mach.cmd_of_sexp args.cmd in
@@ -577,6 +605,7 @@ and appendEntriesRs (res: Rpcs.AppendEntriesRes.t) id (s:State.t) =
     ( debug ("State machine isn't expecting this cmd so ignore"); (s,[]))
     )
 
+(* When the node receive a client response,it will call the function and send the response *)
 and clientRs (res: Rpcs.ClientRes.t) (s:Client.t) = 
   (*TODO: make check if old packets mess this up *)
   debug ("Simulating clients response");
@@ -599,7 +628,7 @@ and clientRs (res: Rpcs.ClientRes.t) (s:Client.t) =
   | Some _ | None -> 
     debug "ignoring reponse as its not for the currently outstanding request"; (s,[])
 
-
+(* client send a request *)
 and clientCommit (s: Client.t) =
   match (s.workload) with
   | cmd::later -> 
@@ -689,6 +718,7 @@ let kill (s:State.t) =
   debug ((IntID.to_string s.id)^"node has failed");
   [SimulationEvent (nxt_recover (s.time()), s.id, Wake)]
 
+(* the simulator apply raft event *)
 let apply_RaftEvent (st: State.t status) (e: (MonoTime.t,IntID.t,State.t,Client.t) event) (t: MonoTime.t) 
    : (State.t * EventList.item list) option =
   (* wait used in realtime simulation, just instant unit for DES *)
@@ -705,6 +735,7 @@ let apply_RaftEvent (st: State.t status) (e: (MonoTime.t,IntID.t,State.t,Client.
      None
  | Notfound -> assert false
 
+(* the simulator apply wake or kill event *)
 let apply_SimulationEvent (sl: StateList.t) (e: failures) (t: MonoTime.t) (id:IntID.t) 
    : StateList.t * EventList.item list =
   MonoTime.wait_until t;
@@ -723,6 +754,7 @@ let apply_SimulationEvent (sl: StateList.t) (e: failures) (t: MonoTime.t) (id:In
       let e_new = kill (StateList.find_wst sl_new id) in
       (sl_new,e_new) )
 
+(* the simulator apply client event *)
 let apply_ClientEvent (cl: Client.t) (e: (MonoTime.t,IntID.t,State.t,Client.t) client) (t: MonoTime.t) 
    : (Client.t * EventList.item list) =
   (* wait used in realtime simulation, just instant unit for DES *)
@@ -733,7 +765,7 @@ let apply_ClientEvent (cl: Client.t) (e: (MonoTime.t,IntID.t,State.t,Client.t) c
      debug (Client.print cl_new);
      (cl_new,e_new)
 
-
+(* terminate the simulation process *)
 let terminate reason sl cl = 
   (match reason with
   | LeaderEst -> debug "terminating as leader has been agreed"
@@ -743,6 +775,7 @@ let terminate reason sl cl =
   debug (StateList.check_safety sl);
   termination_output reason sl cl
 
+(* the core of the simulator *)
 (* Main excuation cycle *)  
 let rec run_multi
   (sl: StateList.t) 
@@ -783,7 +816,7 @@ let rec run_multi
 
   | Some (Ignore t, els) -> run_multi sl els cl
 
-
+(* initialize the eventlist with raft event, simulation event, term event, client event *)
 let init_eventlist num  :EventList.t  =  
   let initial_RaftEvent = 
     List.init num ~f:(fun i ->
@@ -797,7 +830,7 @@ let init_eventlist num  :EventList.t  =
   let inital_ClientEvent = [ClientEvent (MonoTime.init(), RaftImpl.clientCommit)] in
   EventList.init (initial_SimulationEvent@initial_RaftEvent@inital_ClientEvent@term_event)
 
-
+(* Start the Simulator *)
 let start () =
   debug "Raft Simulator is Starting Up ...";
   json ("'numNodes':"^(string_of_int P.nodes)^",");
